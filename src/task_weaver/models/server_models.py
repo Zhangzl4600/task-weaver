@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Dict, List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # 任务需要的资源类型 | 也是服务器类型 但不严格对等
@@ -77,6 +77,7 @@ class Server(BaseModel):
     server_type: ResourceType  # 服务器资源类型
     status: ServerStatus = ServerStatus.stop
     tier: ServerTier = ServerTier.STANDARD  # 替换原来的 tier
+    max_concurrency: int = Field(default=1, ge=1)
 
     def check_available_task_type(self, available_task_type: str):
         return available_task_type in self.available_task_types

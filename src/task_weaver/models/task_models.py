@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from .server_models import ResourceType, Server
 
-T = TypeVar("T")  # Return type for executor
+T = TypeVar("T")  # 执行器返回类型
 
 
 class TaskStatus(str, Enum):
@@ -49,7 +49,7 @@ class TaskPriority(str, Enum):
 
 
 class TaskInfo(BaseModel):
-    """Information about a specific task instance"""
+    """单个任务实例的运行信息。"""
 
     task_id: str
     task_type: str  # References TaskDefinition.task_type
@@ -67,7 +67,7 @@ class TaskInfo(BaseModel):
     message: str = "Task is queued."
 
     def model_dump(self) -> Dict[str, Any]:
-        """Serialize the model with datetime handling"""
+        """序列化模型，并处理 datetime 字段。"""
         return {
             "task_id": self.task_id,
             "task_type": self.task_type,
@@ -87,8 +87,8 @@ class TaskInfo(BaseModel):
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "TaskInfo":
-        """Create TaskInfo instance from JSON data with datetime handling"""
-        # Convert ISO format strings to datetime objects
+        """从 JSON 数据创建 TaskInfo，并处理 datetime 字段。"""
+        # 将 ISO 格式字符串转换为 datetime 对象
         if isinstance(data.get("create_time"), str):
             data["create_time"] = datetime.fromisoformat(data["create_time"])
         if isinstance(data.get("start_time"), str):
@@ -99,7 +99,7 @@ class TaskInfo(BaseModel):
 
 
 class TaskExecutor(Protocol[T]):
-    """Type protocol for task executors"""
+    """任务执行器协议定义。"""
 
     async def __call__(
         self,
@@ -124,7 +124,7 @@ class Task:
 
 
 class BaseTaskExecutor(Generic[T]):
-    """Base class for task executors that implements TaskExecutor protocol"""
+    """任务执行器基类，实现 TaskExecutor 协议。"""
 
     async def __call__(
         self,
@@ -137,7 +137,7 @@ class BaseTaskExecutor(Generic[T]):
 
 
 class TaskDefinition:
-    """Definition of a task type that plugins can register"""
+    """可注册任务类型的定义。"""
 
     def __init__(
         self,
@@ -147,17 +147,23 @@ class TaskDefinition:
         required_resource: ResourceType,
         description: str = "",
         version: str = "1.0.0",
+        max_concurrency: Optional[int] = None,
+        subtask_concurrency: Optional[Dict[str, int]] = None,
+        subtask_key: str = "provider",
     ):
         self.name = name
         self.task_type = task_type
         self.executor = executor
         self.required_resource = required_resource
+        self.max_concurrency = max_concurrency
+        self.subtask_concurrency = subtask_concurrency
+        self.subtask_key = subtask_key
         self.description = description
         self.version = version
 
 
 class TaskQueueItem:
-    """Class representing an item in the task queue"""
+    """队列中任务项的数据结构。"""
 
     def __init__(self, priority: int, task: TaskInfo):
         self.priority = priority
