@@ -342,9 +342,6 @@ class TaskManager:
                         break
 
                     task: Task = await self._queues[task_type].get()
-                    logger.info(
-                        f"Processing task {task.task_info.task_id} of type {task_type}"
-                    )
                     acquired_slots, blocked_slots = await self._try_acquire_task_slots(
                         task
                     )
@@ -390,6 +387,9 @@ class TaskManager:
                     else:
                         logger.info(f"{task_type} doesn't require server, executing...")
 
+                    logger.info(
+                        f"Processing task {task.task_info.task_id} of type {task_type}"
+                    )
                     asyncio.create_task(
                         self._execute_task(task, server, release_slots=acquired_slots)
                     )
