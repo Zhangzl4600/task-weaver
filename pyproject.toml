@@ -3,15 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "task-weaver"
-version = "0.2.1"
+name = "task_weaver_hprt"
+version = "0.3.1"
 description = "A flexible task scheduling and server management library"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [
-    { name = "creeponsky", email = "wenhaozuo1@gmail.com" }
-]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -32,9 +29,15 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/creeponsky/task-weaver"
-Documentation = "https://task-weaver.readthedocs.io/"
-Repository = "https://github.com/creeponsky/task-weaver.git"
+Homepage = "https://github.com/Zhangzl4600/task-weaver"
+Documentation = "https://github.com/Zhangzl4600/task-weaver"
+Repository = "https://github.com/Zhangzl4600/task-weaver.git"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/task_weaver"]
+
+[tool.hatch.build.targets.sdist]
+packages = ["src/task_weaver"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
