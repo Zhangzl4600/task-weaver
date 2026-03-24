@@ -255,6 +255,12 @@ class TaskManager:
         task_info.message = message
         await self._notify_task_info_change(task_info)
 
+    def _set_task_error_if_empty(self, task_info: TaskInfo, error_msg: str) -> None:
+        """仅在业务侧未写入错误信息时，回填框架捕获到的异常详情。"""
+        if task_info.error and task_info.error.strip():
+            return
+        task_info.error = error_msg
+
     async def create_task(
         self, task_type: str, priority: TaskPriority, *args, **kwargs
     ) -> Task:
@@ -417,7 +423,7 @@ class TaskManager:
                         await self.update_task_status(
                             task.task_info, TaskStatus.FAIL, f"Task failed: {error_msg}"
                         )
-                        task.task_info.error = error_msg
+                        self._set_task_error_if_empty(task.task_info, error_msg)
                         await task_catalog.notify_task_completion(task.task_info)
                         self._queues[task_type].task_done()
         except Exception as e:
@@ -471,7 +477,7 @@ class TaskManager:
                 task.task_info, TaskStatus.FAIL, "Task failed"
             )
             program_manager.update_failed_task_num(task.task_info.task_type)
-            task.task_info.error = error_msg
+            self._set_task_error_if_empty(task.task_info, error_msg)
             raise
         finally:
             task.task_info.finish_time = datetime.now()

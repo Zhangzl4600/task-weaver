@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "task_weaver_hprt"
-version = "0.3.2"
+version = "0.3.4"
 description = "A flexible task scheduling and server management library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,12 @@ Repository = "https://github.com/Zhangzl4600/task-weaver.git"
 packages = ["src/task_weaver"]
 
 [tool.hatch.build.targets.sdist]
-packages = ["src/task_weaver"]
+include = [
+    "/src/task_weaver",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml"
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
