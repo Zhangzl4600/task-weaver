@@ -15,6 +15,8 @@ from ..utils.cache import CacheManager, CacheType
 class ServerManager:
     """服务器注册、状态维护与资源分配管理器。"""
 
+    HEALTH_CHECK_CACHE_TTL = 10.0
+
     def __init__(self):
         """初始化服务器管理器与索引结构。"""
         self.cache_manager = CacheManager("server_cache", CacheType.SERVER)
@@ -23,7 +25,11 @@ class ServerManager:
         self.running_servers: List[Server] = []
         self.initialized = False
         self._lock = asyncio.Lock()
+        self._init_lock = asyncio.Lock()
+        self._health_check_lock = asyncio.Lock()
         self._server_active_tasks: Dict[str, int] = {}
+        self._server_health_cache: Dict[str, float] = {}
+        self._health_check_tasks: Dict[str, asyncio.Task] = {}
 
         # 索引结构，加速筛选
         self.servers_by_status: Dict[ServerStatus, List[Server]] = {
@@ -34,6 +40,36 @@ class ServerManager:
     def _server_key(self, server: Server) -> str:
         """生成服务器在内部索引中的唯一键。"""
         return server.server_name or server.ip
+
+    def _mark_server_healthy(self, server: Server):
+        """记录最近一次健康检查成功时间。"""
+        self._server_health_cache[self._server_key(server)] = time.monotonic()
+
+    def _clear_server_health_cache(self, server: Server):
+        """清除服务器健康检查缓存。"""
+        self._server_health_cache.pop(self._server_key(server), None)
+
+    def _has_recent_health_check(self, server: Server) -> bool:
+        """判断服务器是否有近期成功的健康检查结果。"""
+        last_success_at = self._server_health_cache.get(self._server_key(server))
+        if last_success_at is None:
+            return False
+        return (time.monotonic() - last_success_at) < self.HEALTH_CHECK_CACHE_TTL
+
+    def _set_running_servers(self, servers: List[Server]):
+        """按唯一键重建运行中的服务器列表。"""
+        deduped_servers: Dict[str, Server] = {}
+        for server in servers:
+            deduped_servers[self._server_key(server)] = server
+        self.running_servers = list(deduped_servers.values())
+
+    def _add_running_server_if_missing(self, server: Server) -> bool:
+        """向运行池中添加服务器，已存在则跳过。"""
+        server_key = self._server_key(server)
+        if any(self._server_key(item) == server_key for item in self.running_servers):
+            return False
+        self.running_servers.append(server)
+        return True
 
     def _get_server_active_tasks(self, server: Server) -> int:
         """获取服务器当前占用的并发槽位数。"""
@@ -72,7 +108,11 @@ class ServerManager:
 
     async def ensure_initialized(self):
         """确保管理器在使用前已完成初始化。"""
-        if not self.initialized:
+        if self.initialized:
+            return
+        async with self._init_lock:
+            if self.initialized:
+                return
             await self._init_running_server()
             self.initialized = True
 
@@ -85,7 +125,7 @@ class ServerManager:
     async def _init_running_server(self):
         """启动时校验并恢复可运行服务器列表。"""
         start_time = time.time()
-        self.running_servers: List[Server] = []
+        recovered_running_servers: List[Server] = []
         self._server_active_tasks = {
             self._server_key(server): 0 for server in self.all_servers
         }
@@ -99,23 +139,27 @@ class ServerManager:
                 is_connected = await self.check_server(server)
                 if is_connected:
                     logger.info(f"服务器{server} error,但是重连成功")
-                    self.set_server_status(server, ServerStatus.idle)
+                    server.status = ServerStatus.idle
+                    self._mark_server_healthy(server)
                 else:
                     logger.info(f"服务器{server} error,重连失败")
-                    self.set_server_status(server, ServerStatus.stop)
+                    server.status = ServerStatus.stop
+                    self._clear_server_health_cache(server)
             if server.status == ServerStatus.idle:
                 if await self.check_server(server):
-                    self.running_servers.append(server)
+                    recovered_running_servers.append(server)
                     running_num += 1
                 else:
                     logger.info(f"服务器{server} idle,但是连接失败")
-                    self.set_server_status(server, ServerStatus.stop)
+                    server.status = ServerStatus.stop
+                    self._clear_server_health_cache(server)
+
+        self._set_running_servers(recovered_running_servers)
 
         program_manager.set_running_gpu_num(running_num)
         program_manager.set_gpu_num(len(self.all_servers))
 
-        # 初始化索引结构
-        self._update_server_indices()
+        self._save_servers()
         await program_manager.record_operation_time("init_running_server", start_time)
 
     def _update_server_indices(self):
@@ -253,27 +297,44 @@ class ServerManager:
             ]
             candidate_servers.sort(key=lambda x: x.tier.value, reverse=True)
 
-            for server in candidate_servers:
-                if await self.check_server(server):
-                    server_key = self._server_key(server)
-                    self._server_active_tasks[server_key] = (
-                        self._server_active_tasks.get(server_key, 0) + 1
-                    )
-                    self._sync_server_runtime_status(server)
-                    self._save_servers()
-                    self._refresh_idle_events(server.available_task_types)
-                    if available_task_type:
-                        await program_manager.record_task_time(
-                            available_task_type, start_time
-                        )
-                    return server
-                self.set_server_status(server, ServerStatus.error)
+        for server in candidate_servers:
+            if not await self.check_server(server):
+                async with self._lock:
+                    if self.check_server_running(server):
+                        self.set_server_status(server, ServerStatus.error)
                 logger.error(f"运行服务器({server})异常，无法连接")
+                continue
 
-            if available_task_type:
+            async with self._lock:
+                if not self.check_server_running(server):
+                    continue
+                if available_task_type and not server.check_available_task_type(
+                    available_task_type
+                ):
+                    continue
+                if task_resource_type and server.server_type != task_resource_type:
+                    continue
+                if self._get_server_available_slots(server) <= 0:
+                    continue
+
+                server_key = self._server_key(server)
+                self._server_active_tasks[server_key] = (
+                    self._server_active_tasks.get(server_key, 0) + 1
+                )
+                self._sync_server_runtime_status(server)
+                self._save_servers()
+                self._refresh_idle_events(server.available_task_types)
+                if available_task_type:
+                    await program_manager.record_task_time(
+                        available_task_type, start_time
+                    )
+                return server
+
+        if available_task_type:
+            async with self._lock:
                 self._ensure_server_idle_event(available_task_type)
                 self.server_idle_event[available_task_type].clear()
-            return None
+        return None
 
     async def get_server_list(self, server_name_list: List[str] = None) -> List[Server]:
         """获取服务器列表，可按名称过滤。"""
@@ -293,32 +354,58 @@ class ServerManager:
             logger.error(f"Get server list failed: {str(e)}\n{traceback.format_exc()}")
             return []
 
-    async def check_server(self, server: Server):
-        """检测服务器连通性，失败时按退避策略重试。"""
+    async def _perform_health_check(self, server: Server) -> bool:
+        """真正执行服务器连通性检测。"""
         start_time = time.time()
         backoff = 1
-        for i in range(3):
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        f"{server.ip}", timeout=2, follow_redirects=True
-                    )
-                    # Any response indicates server is up
+        try:
+            for i in range(3):
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.get(
+                            f"{server.ip}", timeout=2, follow_redirects=True
+                        )
+                    self._mark_server_healthy(server)
                     return True
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
-                if i < 2:
-                    await asyncio.sleep(backoff)
-                    logger.info(
-                        f"check_server: 服务器({server})异常：{str(e)}，尝试重试:{backoff}秒"
-                    )
-                else:
-                    logger.error(f"check_server: 服务器({server})异常：{str(e)}")
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    if i < 2:
+                        await asyncio.sleep(backoff)
+                        logger.info(
+                            f"check_server: 服务器({server})异常：{str(e)}，尝试重试:{backoff}秒"
+                        )
+                    else:
+                        logger.error(f"check_server: 服务器({server})异常：{str(e)}")
+                        self._clear_server_health_cache(server)
+                        return False
+                except Exception as e:
+                    logger.error(f"check_server: 服务器({server})异常：{e}")
+                    self._clear_server_health_cache(server)
                     return False
-            except Exception as e:
-                logger.error(f"check_server: 服务器({server})异常：{e}")
-                return False
-        await program_manager.record_operation_time("check_server", start_time)
-        return True
+            self._clear_server_health_cache(server)
+            return False
+        finally:
+            await program_manager.record_operation_time("check_server", start_time)
+
+    async def check_server(self, server: Server):
+        """检测服务器连通性，失败时按退避策略重试。"""
+        if self._has_recent_health_check(server):
+            return True
+
+        server_key = self._server_key(server)
+        async with self._health_check_lock:
+            if self._has_recent_health_check(server):
+                return True
+            task = self._health_check_tasks.get(server_key)
+            if task is None:
+                task = asyncio.create_task(self._perform_health_check(server))
+                self._health_check_tasks[server_key] = task
+
+        try:
+            return await task
+        finally:
+            async with self._health_check_lock:
+                if self._health_check_tasks.get(server_key) is task and task.done():
+                    self._health_check_tasks.pop(server_key, None)
 
     async def release_server(self, server: Server):
         """释放服务器一个并发槽位。"""
@@ -344,6 +431,11 @@ class ServerManager:
             self._server_active_tasks[self._server_key(server)] = 0
 
         if status == ServerStatus.idle:
+            self._mark_server_healthy(server)
+        else:
+            self._clear_server_health_cache(server)
+
+        if status == ServerStatus.idle:
             for server_type in server.available_task_types:
                 self._ensure_server_idle_event(server_type)
                 self.server_idle_event[server_type].set()
@@ -358,24 +450,32 @@ class ServerManager:
     ):
         """将服务器加入运行池。"""
         start_time = time.time()
+        await self.ensure_initialized()
+        server = None
         async with self._lock:
             server = self.get_server_by_identifier(ip, server_name)
             if not server:
                 logger.error(f"Server not found - ip:{ip} server_name:{server_name}")
                 return False, f"ip:{ip} server_name:{server_name} 服务器不存在"
 
-            if server in self.running_servers:
+            if self.check_server_running(server):
                 logger.info(f"Server {server} is already running")
                 return False, f"服务器{server}已经在运行"
 
-            # 加入运行池前做连通性检查
-            if not await self.check_server(server):
-                logger.error(f"Server {server} connection check failed")
-                return False, f"服务器{server}连接检查失败"
+        # 加入运行池前做连通性检查
+        if not await self.check_server(server):
+            logger.error(f"Server {server} connection check failed")
+            return False, f"服务器{server}连接检查失败"
 
-            self.running_servers.append(server)
+        async with self._lock:
+            if self.check_server_running(server):
+                logger.info(f"Server {server} is already running")
+                return False, f"服务器{server}已经在运行"
+
+            self._add_running_server_if_missing(server)
             self._server_active_tasks[self._server_key(server)] = 0
             self.set_server_status(server, ServerStatus.idle)
+            self.initialized = True
 
             program_manager.set_running_gpu_num(len(self.running_servers))
             await program_manager.record_operation_time(
