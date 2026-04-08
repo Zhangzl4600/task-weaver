@@ -1,7 +1,13 @@
 from enum import Enum
 from typing import Dict, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from ..utils.routing import (
+    DEFAULT_ROUTE_GROUP,
+    build_dispatch_key,
+    normalize_route_group,
+)
 
 
 # 任务需要的资源类型 | 也是服务器类型 但不严格对等
@@ -73,14 +79,44 @@ class Server(BaseModel):
     ip: str
     server_name: str
     description: str
-    available_task_types: List[str]  # 服务器可以跑的任务类型
+    available_task_types: List[str] = Field(default_factory=list)  # 服务器可以跑的任务类型
+    task_routes: Dict[str, List[str]] = Field(default_factory=dict)
     server_type: ResourceType  # 服务器资源类型
     status: ServerStatus = ServerStatus.stop
     tier: ServerTier = ServerTier.STANDARD  # 替换原来的 tier
     max_concurrency: int = Field(default=1, ge=1)
 
+    @model_validator(mode="after")
+    def normalize_task_routes(self) -> "Server":
+        if self.task_routes:
+            self.task_routes = {
+                task_type: [
+                    normalize_route_group(route_group) for route_group in route_groups
+                ]
+                for task_type, route_groups in self.task_routes.items()
+            }
+        else:
+            self.task_routes = {
+                task_type: [DEFAULT_ROUTE_GROUP]
+                for task_type in self.available_task_types
+            }
+        self.available_task_types = list(self.task_routes.keys())
+        return self
+
     def check_available_task_type(self, available_task_type: str):
-        return available_task_type in self.available_task_types
+        return available_task_type in self.task_routes
+
+    def check_available_task_route(
+        self, task_type: str, route_group: str = DEFAULT_ROUTE_GROUP
+    ) -> bool:
+        return normalize_route_group(route_group) in self.task_routes.get(task_type, [])
+
+    def get_dispatch_keys(self) -> List[str]:
+        dispatch_keys: List[str] = []
+        for task_type, route_groups in self.task_routes.items():
+            for route_group in route_groups:
+                dispatch_keys.append(build_dispatch_key(task_type, route_group))
+        return dispatch_keys
 
     # to str
     def __str__(self):

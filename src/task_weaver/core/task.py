@@ -8,6 +8,7 @@ from ..exceptions import ProcessingError
 from ..log.logger import logger
 from ..models.server_models import ResourceType, Server
 from ..models.task_models import Task, TaskInfo, TaskPriority, TaskStatus
+from ..utils.routing import DEFAULT_ROUTE_GROUP, build_dispatch_key, normalize_route_group
 from .program_info import program_manager
 from .server import server_manager
 from .task_catalog import task_catalog
@@ -27,19 +28,19 @@ class TaskManager:
     - 错误处理与恢复
     - 任务状态变化通知
 
-    TaskManager 为每个任务类型维护独立队列，并结合资源状态进行调度。
+    TaskManager 为每条调度通道维护独立队列，并结合资源状态进行调度。
     """
 
     def __init__(self):
         """初始化任务管理器的运行态数据结构。"""
         logger.info("Initializing TaskManager...")
-        # 每个任务类型独立队列，用于并发调度
+        # 每条调度通道独立队列，用于并发调度
         self._queues: Dict[str, asyncio.Queue] = {}
 
         # 运行中的任务内存索引
         self._tasks: Dict[str, Task] = {}
 
-        # 每个任务类型对应一个队列处理协程
+        # 每条调度通道对应一个队列处理协程
         self._processors: Dict[str, asyncio.Task] = {}
 
         # 队列处理协程运行状态
@@ -89,6 +90,14 @@ class TaskManager:
         if not task_definition:
             return None
         return task_definition.max_concurrency
+
+    def _get_task_route_group(self, task: Task) -> str:
+        """读取任务的路由组。"""
+        return task.task_info.route_group
+
+    def _get_task_dispatch_key(self, task: Task) -> str:
+        """生成任务在调度层的唯一调度键。"""
+        return build_dispatch_key(task.task_info.task_type, self._get_task_route_group(task))
 
     def _get_subtask_slot_limit(self, task: Task) -> tuple[Optional[str], Optional[int]]:
         """按子任务规则计算并发槽位 key 与上限。"""
@@ -262,7 +271,12 @@ class TaskManager:
         task_info.error = error_msg
 
     async def create_task(
-        self, task_type: str, priority: TaskPriority, *args, **kwargs
+        self,
+        task_type: str,
+        priority: TaskPriority,
+        *args,
+        route_group: str = DEFAULT_ROUTE_GROUP,
+        **kwargs,
     ) -> Task:
         """按指定参数创建任务实例。"""
         logger.info(f"Creating new task of type {task_type} with priority {priority}")
@@ -280,6 +294,7 @@ class TaskManager:
                 TaskInfo(
                     task_id=task_id,
                     task_type=task_type,
+                    route_group=normalize_route_group(route_group),
                     status=TaskStatus.INIT,
                     priority=priority,
                     create_time=datetime.now(),
@@ -304,33 +319,34 @@ class TaskManager:
     # 因为这代表两种不同状态，一个是状态创建INIT、一个是状态预执行，中间或许业务层会有一些自定义操作而不直接入队
     async def add_task(self, task: Task) -> None:
         """将任务加入对应处理队列。"""
+        dispatch_key = self._get_task_dispatch_key(task)
         self._tasks[task.task_info.task_id] = task
-        await self._ensure_task_processor(task.task_info.task_type)
-        await self._queues[task.task_info.task_type].put(task)
+        await self._ensure_task_processor(dispatch_key)
+        await self._queues[dispatch_key].put(task)
         await self.update_task_status(
             task.task_info, TaskStatus.INIT, "Task is queued."
         )
         return task
 
-    async def _ensure_task_processor(self, task_type: str) -> None:
+    async def _ensure_task_processor(self, dispatch_key: str) -> None:
         """确保给定任务类型的队列处理协程已启动。"""
-        if task_type not in self._queues:
-            logger.info(f"Creating new queue for task type {task_type}")
-            self._queues[task_type] = asyncio.Queue()
-            self._is_processor_running[task_type] = False
+        if dispatch_key not in self._queues:
+            logger.info(f"Creating new queue for dispatch key {dispatch_key}")
+            self._queues[dispatch_key] = asyncio.Queue()
+            self._is_processor_running[dispatch_key] = False
 
-        if not self._is_processor_running[task_type]:
-            logger.info(f"Starting processor for task type {task_type}")
+        if not self._is_processor_running[dispatch_key]:
+            logger.info(f"Starting processor for dispatch key {dispatch_key}")
             async with self._task_lock:
-                if not self._is_processor_running[task_type]:
-                    self._is_processor_running[task_type] = True
-                    self._processors[task_type] = asyncio.create_task(
-                        self._process_queue(task_type)
+                if not self._is_processor_running[dispatch_key]:
+                    self._is_processor_running[dispatch_key] = True
+                    self._processors[dispatch_key] = asyncio.create_task(
+                        self._process_queue(dispatch_key)
                     )
 
-    async def _process_queue(self, task_type: str) -> None:
+    async def _process_queue(self, dispatch_key: str) -> None:
         """处理指定任务类型队列中的任务。"""
-        logger.info(f"Starting queue processor for task type {task_type}")
+        logger.info(f"Starting queue processor for dispatch key {dispatch_key}")
         last_warning_time = 0  # 上次告警时间
         warning_interval = 60  # 告警间隔（秒）
         try:
@@ -340,21 +356,23 @@ class TaskManager:
                 acquired_slots: list[str] = []
                 task_handed_off = False
                 try:
+                    if self._queues[dispatch_key].qsize() == 0:
+                        break
+
+                    task = await self._queues[dispatch_key].get()
+                    task_type = task.task_info.task_type
+                    route_group = self._get_task_route_group(task)
                     task_definition = task_catalog.get_task_definition(task_type)
                     if not task_definition:
                         raise ProcessingError(f"Task type {task_type} not found")
 
-                    if self._queues[task_type].qsize() == 0:
-                        break
-
-                    task: Task = await self._queues[task_type].get()
                     acquired_slots, blocked_slots = await self._try_acquire_task_slots(
                         task
                     )
                     if blocked_slots:
                         # 当前任务槽位不足时放回队尾，避免阻塞后续可执行任务
-                        await self._queues[task_type].put(task)
-                        self._queues[task_type].task_done()
+                        await self._queues[dispatch_key].put(task)
+                        self._queues[dispatch_key].task_done()
                         try:
                             self._ensure_task_slot_state(blocked_slots[0])
                             await asyncio.wait_for(
@@ -370,10 +388,11 @@ class TaskManager:
                             server = await server_manager.get_idle_server(
                                 task_definition.task_type,
                                 task_definition.required_resource,
+                                route_group=route_group,
                             )
                             if server:
                                 logger.info(
-                                    f"Allocated server {server.server_name} for task type {task_type}"
+                                    f"Allocated server {server.server_name} for dispatch key {dispatch_key}"
                                 )
                                 break
 
@@ -385,16 +404,18 @@ class TaskManager:
                             current_time = datetime.now().timestamp()
                             if current_time - last_warning_time >= warning_interval:
                                 logger.warning(
-                                    f"No available servers for task type {task_type}, waiting..."
+                                    f"No available servers for dispatch key {dispatch_key}, waiting..."
                                 )
                                 last_warning_time = current_time
                             await asyncio.sleep(0.5)
                             acquired_slots = await self._acquire_task_slots(task)
                     else:
-                        logger.info(f"{task_type} doesn't require server, executing...")
+                        logger.info(
+                            f"{dispatch_key} doesn't require server, executing..."
+                        )
 
                     logger.info(
-                        f"Processing task {task.task_info.task_id} of type {task_type}"
+                        f"Processing task {task.task_info.task_id} for dispatch key {dispatch_key}"
                     )
                     asyncio.create_task(
                         self._execute_task(task, server, release_slots=acquired_slots)
@@ -402,13 +423,13 @@ class TaskManager:
                     acquired_slots = []
                     task_handed_off = True
                 except asyncio.CancelledError:
-                    logger.error(f"Queue processor for {task_type} was cancelled")
+                    logger.error(f"Queue processor for {dispatch_key} was cancelled")
                     if acquired_slots:
                         await self._release_task_slots(acquired_slots)
                     if server:
                         await server_manager.release_server(server)
                     if task and not task_handed_off:
-                        self._queues[task_type].task_done()
+                        self._queues[dispatch_key].task_done()
                     break
                 except Exception as e:
                     if acquired_slots:
@@ -425,14 +446,14 @@ class TaskManager:
                         )
                         self._set_task_error_if_empty(task.task_info, error_msg)
                         await task_catalog.notify_task_completion(task.task_info)
-                        self._queues[task_type].task_done()
+                        self._queues[dispatch_key].task_done()
         except Exception as e:
             logger.error(
-                f"Fatal error in _process_queue for {task_type}: {str(e)}\n{traceback.format_exc()}"
+                f"Fatal error in _process_queue for {dispatch_key}: {str(e)}\n{traceback.format_exc()}"
             )
         finally:
-            logger.warning(f"Queue processor for {task_type} is shutting down")
-            self._is_processor_running[task_type] = False
+            logger.warning(f"Queue processor for {dispatch_key} is shutting down")
+            self._is_processor_running[dispatch_key] = False
 
     async def _execute_task(
         self, task: Task, server: Server | None, release_slots: Optional[list[str]] = None
@@ -491,7 +512,8 @@ class TaskManager:
             if task:
                 logger.debug(f"Marking task {task.task_info.task_id} as done in queue")
                 await task_catalog.notify_task_completion(task.task_info)
-                self._queues[task.task_info.task_type].task_done()
+                dispatch_key = self._get_task_dispatch_key(task)
+                self._queues[dispatch_key].task_done()
             if server:
                 logger.debug(f"Releasing server {server.server_name}")
                 await server_manager.release_server(server)

@@ -8,6 +8,7 @@ import httpx
 from ..core.program_info import program_manager
 from ..log.logger import logger
 from ..models.server_models import ResourceType, Server, ServerStatus, ServerTier
+from ..utils.routing import DEFAULT_ROUTE_GROUP, build_dispatch_key, normalize_route_group
 from ..utils.cache import CacheManager, CacheType
 # TODO 这里还需要每个插件当添加server的时候因为server是由可运行的任务类型的，对应的任务类型的插件就执行runningserver的连接测试，来确保服务可用
 
@@ -95,16 +96,16 @@ class ServerManager:
         else:
             server.status = ServerStatus.idle
 
-    def _refresh_idle_events(self, task_types: Optional[List[str]] = None):
-        """按任务类型刷新“有空闲资源”事件状态。"""
-        if task_types is None:
-            task_types = list(self.server_idle_event.keys())
-        for task_type in task_types:
-            self._ensure_server_idle_event(task_type)
-            if self.check_has_idle(task_type):
-                self.server_idle_event[task_type].set()
+    def _refresh_idle_events(self, dispatch_keys: Optional[List[str]] = None):
+        """按调度键刷新“有空闲资源”事件状态。"""
+        if dispatch_keys is None:
+            dispatch_keys = list(self.server_idle_event.keys())
+        for dispatch_key in dispatch_keys:
+            self._ensure_server_idle_event(dispatch_key)
+            if self._check_has_idle_by_dispatch_key(dispatch_key):
+                self.server_idle_event[dispatch_key].set()
             else:
-                self.server_idle_event[task_type].clear()
+                self.server_idle_event[dispatch_key].clear()
 
     async def ensure_initialized(self):
         """确保管理器在使用前已完成初始化。"""
@@ -116,11 +117,29 @@ class ServerManager:
             await self._init_running_server()
             self.initialized = True
 
-    def _ensure_server_idle_event(self, server_type: str):
-        """确保指定任务类型存在可用服务器事件对象。"""
-        if server_type not in self.server_idle_event:
-            self.server_idle_event[server_type] = asyncio.Event()
-            self.server_idle_event[server_type].set()
+    def _ensure_server_idle_event(self, dispatch_key: str):
+        """确保指定调度键存在可用服务器事件对象。"""
+        if dispatch_key not in self.server_idle_event:
+            self.server_idle_event[dispatch_key] = asyncio.Event()
+            self.server_idle_event[dispatch_key].set()
+
+    def _get_server_dispatch_keys(self, server: Server) -> List[str]:
+        """获取某台服务器支持的全部调度键。"""
+        return server.get_dispatch_keys()
+
+    def _check_has_idle_by_dispatch_key(self, dispatch_key: str) -> bool:
+        """检查指定调度键是否存在空闲槽位。"""
+        candidate_servers = [
+            server
+            for server in self.running_servers
+            if self._get_server_available_slots(server) > 0
+        ]
+        candidate_servers = [
+            server
+            for server in candidate_servers
+            if dispatch_key in self._get_server_dispatch_keys(server)
+        ]
+        return bool(candidate_servers)
 
     async def _init_running_server(self):
         """启动时校验并恢复可运行服务器列表。"""
@@ -199,7 +218,11 @@ class ServerManager:
                 return server
         return None
 
-    def check_has_idle(self, server_type: str = None):
+    def check_has_idle(
+        self,
+        server_type: str = None,
+        route_group: str = DEFAULT_ROUTE_GROUP,
+    ):
         """检查是否存在可用于指定任务类型的空闲槽位。"""
         candidate_servers = [
             server
@@ -207,10 +230,11 @@ class ServerManager:
             if self._get_server_available_slots(server) > 0
         ]
         if server_type:
+            normalized_route_group = normalize_route_group(route_group)
             candidate_servers = [
                 server
                 for server in candidate_servers
-                if server.check_available_task_type(server_type)
+                if server.check_available_task_route(server_type, normalized_route_group)
             ]
         return bool(candidate_servers)
 
@@ -227,6 +251,7 @@ class ServerManager:
         available_task_types: List[str] = None,
         server_type: ResourceType = ResourceType.GPU,
         max_concurrency: int = 1,
+        task_routes: Optional[Dict[str, List[str]]] = None,
     ):
         """注册或覆盖服务器配置。"""
         if max_concurrency < 1:
@@ -234,36 +259,33 @@ class ServerManager:
         start_time = time.time()
         async with self._lock:
             old_server = self.get_server_by_identifier(ip, server_name)
+            updated_server = Server(
+                ip=ip,
+                server_name=server_name,
+                description=description,
+                tier=tier,
+                available_task_types=available_task_types if available_task_types else [],
+                task_routes=task_routes if task_routes else {},
+                server_type=server_type,
+                max_concurrency=max_concurrency,
+                status=old_server.status if old_server else ServerStatus.stop,
+            )
             if old_server:
                 logger.info(f"已经存在服务器：{old_server}")
-                old_server.ip = ip
-                old_server.server_name = server_name
-                old_server.description = description
-                old_server.tier = tier
-                old_server.available_task_types = (
-                    available_task_types if available_task_types else []
-                )
-                old_server.server_type = (
-                    server_type if server_type else old_server.server_type
-                )
-                old_server.max_concurrency = max_concurrency
+                old_server.ip = updated_server.ip
+                old_server.server_name = updated_server.server_name
+                old_server.description = updated_server.description
+                old_server.tier = updated_server.tier
+                old_server.available_task_types = updated_server.available_task_types
+                old_server.task_routes = updated_server.task_routes
+                old_server.server_type = updated_server.server_type
+                old_server.max_concurrency = updated_server.max_concurrency
                 message = f"存在服务器：{old_server}， 已经覆盖配置"
                 logger.info(message)
             else:
-                server = Server(
-                    ip=ip,
-                    server_name=server_name,
-                    description=description,
-                    tier=tier,
-                    available_task_types=available_task_types
-                    if available_task_types
-                    else [],
-                    server_type=server_type,
-                    max_concurrency=max_concurrency,
-                )
-                self.all_servers.append(server)
-                self._server_active_tasks[self._server_key(server)] = 0
-                message = f"添加新服务器：{server}"
+                self.all_servers.append(updated_server)
+                self._server_active_tasks[self._server_key(updated_server)] = 0
+                message = f"添加新服务器：{updated_server}"
                 logger.info(message)
 
             self._save_servers()
@@ -272,10 +294,19 @@ class ServerManager:
             return True, message
 
     async def get_idle_server(
-        self, available_task_type: str = None, task_resource_type: ResourceType = None
+        self,
+        available_task_type: str = None,
+        task_resource_type: ResourceType = None,
+        route_group: str = DEFAULT_ROUTE_GROUP,
     ) -> Optional[Server]:
         """获取一个可用服务器，并占用其一个并发槽位。"""
         start_time = time.time()
+        normalized_route_group = normalize_route_group(route_group)
+        dispatch_key = (
+            build_dispatch_key(available_task_type, normalized_route_group)
+            if available_task_type
+            else None
+        )
         await self.ensure_initialized()
         async with self._lock:
             candidate_servers = list(self.running_servers)
@@ -284,7 +315,9 @@ class ServerManager:
                 candidate_servers = [
                     s
                     for s in candidate_servers
-                    if s.check_available_task_type(available_task_type)
+                    if s.check_available_task_route(
+                        available_task_type, normalized_route_group
+                    )
                 ]
 
             if task_resource_type:
@@ -308,8 +341,8 @@ class ServerManager:
             async with self._lock:
                 if not self.check_server_running(server):
                     continue
-                if available_task_type and not server.check_available_task_type(
-                    available_task_type
+                if available_task_type and not server.check_available_task_route(
+                    available_task_type, normalized_route_group
                 ):
                     continue
                 if task_resource_type and server.server_type != task_resource_type:
@@ -323,17 +356,17 @@ class ServerManager:
                 )
                 self._sync_server_runtime_status(server)
                 self._save_servers()
-                self._refresh_idle_events(server.available_task_types)
+                self._refresh_idle_events(self._get_server_dispatch_keys(server))
                 if available_task_type:
                     await program_manager.record_task_time(
                         available_task_type, start_time
                     )
                 return server
 
-        if available_task_type:
+        if dispatch_key:
             async with self._lock:
-                self._ensure_server_idle_event(available_task_type)
-                self.server_idle_event[available_task_type].clear()
+                self._ensure_server_idle_event(dispatch_key)
+                self.server_idle_event[dispatch_key].clear()
         return None
 
     async def get_server_list(self, server_name_list: List[str] = None) -> List[Server]:
@@ -421,7 +454,7 @@ class ServerManager:
             self._server_active_tasks[server_key] = current_tasks - 1
             self._sync_server_runtime_status(server)
             self._save_servers()
-            self._refresh_idle_events(server.available_task_types)
+            self._refresh_idle_events(self._get_server_dispatch_keys(server))
             return True
 
     def set_server_status(self, server: Server, status: ServerStatus):
@@ -436,11 +469,11 @@ class ServerManager:
             self._clear_server_health_cache(server)
 
         if status == ServerStatus.idle:
-            for server_type in server.available_task_types:
-                self._ensure_server_idle_event(server_type)
-                self.server_idle_event[server_type].set()
+            for dispatch_key in self._get_server_dispatch_keys(server):
+                self._ensure_server_idle_event(dispatch_key)
+                self.server_idle_event[dispatch_key].set()
         elif status in {ServerStatus.stop, ServerStatus.error}:
-            self._refresh_idle_events(server.available_task_types)
+            self._refresh_idle_events(self._get_server_dispatch_keys(server))
 
         self._save_servers()
         return True
@@ -510,5 +543,5 @@ class ServerManager:
             return True, f"删除服务器{server} 成功"
 
 
-# Create manager instance
+# 创建管理器实例
 server_manager = ServerManager()

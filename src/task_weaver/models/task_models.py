@@ -5,6 +5,7 @@ from typing import Any, Dict, Generic, Optional, Protocol, TypeVar
 from pydantic import BaseModel
 
 from .server_models import ResourceType, Server
+from ..utils.routing import DEFAULT_ROUTE_GROUP
 
 T = TypeVar("T")  # 执行器返回类型
 
@@ -53,6 +54,7 @@ class TaskInfo(BaseModel):
 
     task_id: str
     task_type: str  # References TaskDefinition.task_type
+    route_group: str = DEFAULT_ROUTE_GROUP
     status: TaskStatus
     priority: TaskPriority = TaskPriority.MEDIUM
     create_time: datetime = datetime.now()
@@ -71,6 +73,7 @@ class TaskInfo(BaseModel):
         return {
             "task_id": self.task_id,
             "task_type": self.task_type,
+            "route_group": self.route_group,
             "status": self.status,
             "priority": self.priority,
             "progress": self.progress,
@@ -117,10 +120,10 @@ class Task:
         self.kwargs = kwargs
 
     def __str__(self) -> str:
-        return f"Task: id: {self.task_info.task_id}, type: {self.task_info.task_type}, status: {self.task_info.status}, progress: {self.task_info.progress}, remaining_time: {self.task_info.remaining_duration}, data: {self.task_info.result}, msg: {self.task_info.message}, create_time: {self.task_info.create_time}"
+        return f"Task: id: {self.task_info.task_id}, type: {self.task_info.task_type}, route_group: {self.task_info.route_group}, status: {self.task_info.status}, progress: {self.task_info.progress}, remaining_time: {self.task_info.remaining_duration}, data: {self.task_info.result}, msg: {self.task_info.message}, create_time: {self.task_info.create_time}"
 
     def mini_str(self) -> str:
-        return f"Task: id: {self.task_info.task_id}, type: {self.task_info.task_type}"
+        return f"Task: id: {self.task_info.task_id}, type: {self.task_info.task_type}, route_group: {self.task_info.route_group}"
 
 
 class BaseTaskExecutor(Generic[T]):
