@@ -333,9 +333,18 @@ class ServerManager:
         for server in candidate_servers:
             if not await self.check_server(server):
                 async with self._lock:
-                    if self.check_server_running(server):
+                    if not self.check_server_running(server):
+                        continue
+                    if self._get_server_active_tasks(server) <= 0:
                         self.set_server_status(server, ServerStatus.error)
-                logger.error(f"运行服务器({server})异常，无法连接")
+                        logger.error(f"运行服务器({server})异常，无法连接")
+                    else:
+                        # 高并发下健康检查可能因瞬时排队/限流失败，
+                        # 对仍有活跃任务的服务器先跳过本次分配，避免误标为 error。
+                        self._sync_server_runtime_status(server)
+                        logger.warning(
+                            f"运行服务器({server})健康检查失败，但仍有活跃任务，跳过本次分配"
+                        )
                 continue
 
             async with self._lock:
