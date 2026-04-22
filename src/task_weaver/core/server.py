@@ -18,6 +18,7 @@ class ServerManager:
 
     HEALTH_CHECK_CACHE_TTL = 10.0
     RECENT_ACTIVITY_GRACE_TTL = 2.0
+    ALLOCATION_HEALTH_FAILURE_THRESHOLD = 3
 
     def __init__(self):
         """初始化服务器管理器与索引结构。"""
@@ -33,6 +34,7 @@ class ServerManager:
         self._server_health_cache: Dict[str, float] = {}
         self._server_recent_activity: Dict[str, float] = {}
         self._health_check_tasks: Dict[str, asyncio.Task] = {}
+        self._server_health_failures: Dict[str, int] = {}
 
         # 索引结构，加速筛选
         self.servers_by_status: Dict[ServerStatus, List[Server]] = {
@@ -46,7 +48,9 @@ class ServerManager:
 
     def _mark_server_healthy(self, server: Server):
         """记录最近一次健康检查成功时间。"""
-        self._server_health_cache[self._server_key(server)] = time.monotonic()
+        server_key = self._server_key(server)
+        self._server_health_cache[server_key] = time.monotonic()
+        self._server_health_failures[server_key] = 0
 
     def _mark_server_recent_activity(self, server: Server):
         """记录服务器最近一次处于活跃或刚释放任务的时间。"""
@@ -55,6 +59,13 @@ class ServerManager:
     def _clear_server_health_cache(self, server: Server):
         """清除服务器健康检查缓存。"""
         self._server_health_cache.pop(self._server_key(server), None)
+
+    def _record_server_health_failure(self, server: Server) -> int:
+        """记录分配阶段的连续健康检查失败次数。"""
+        server_key = self._server_key(server)
+        failure_count = self._server_health_failures.get(server_key, 0) + 1
+        self._server_health_failures[server_key] = failure_count
+        return failure_count
 
     def _has_recent_activity(self, server: Server) -> bool:
         """判断服务器是否刚结束任务，仍处于短暂恢复窗口。"""
@@ -395,11 +406,23 @@ class ServerManager:
                         self._get_server_active_tasks(server) <= 0
                         and not self._has_recent_activity(server)
                     ):
-                        self.set_server_status(server, ServerStatus.error)
-                        logger.error(
-                            f"服务器健康检查失败并标记为 error: "
-                            f"{self._describe_server_runtime(server)}, dispatch_key={dispatch_key}"
-                        )
+                        failure_count = self._record_server_health_failure(server)
+                        if (
+                            failure_count
+                            >= self.ALLOCATION_HEALTH_FAILURE_THRESHOLD
+                        ):
+                            self.set_server_status(server, ServerStatus.error)
+                            logger.error(
+                                f"服务器健康检查连续失败 {failure_count} 次并标记为 error: "
+                                f"{self._describe_server_runtime(server)}, dispatch_key={dispatch_key}"
+                            )
+                        else:
+                            logger.warning(
+                                f"服务器健康检查失败 {failure_count}/"
+                                f"{self.ALLOCATION_HEALTH_FAILURE_THRESHOLD} 次，"
+                                f"本次跳过分配: {self._describe_server_runtime(server)}, "
+                                f"dispatch_key={dispatch_key}"
+                            )
                     else:
                         # 高并发下健康检查可能因瞬时排队/限流失败，
                         # 对仍有活跃任务或刚释放任务的服务器先跳过本次分配，避免误标为 error。
