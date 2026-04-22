@@ -17,6 +17,7 @@ class ServerManager:
     """服务器注册、状态维护与资源分配管理器。"""
 
     HEALTH_CHECK_CACHE_TTL = 10.0
+    RECENT_ACTIVITY_GRACE_TTL = 2.0
 
     def __init__(self):
         """初始化服务器管理器与索引结构。"""
@@ -30,6 +31,7 @@ class ServerManager:
         self._health_check_lock = asyncio.Lock()
         self._server_active_tasks: Dict[str, int] = {}
         self._server_health_cache: Dict[str, float] = {}
+        self._server_recent_activity: Dict[str, float] = {}
         self._health_check_tasks: Dict[str, asyncio.Task] = {}
 
         # 索引结构，加速筛选
@@ -46,9 +48,54 @@ class ServerManager:
         """记录最近一次健康检查成功时间。"""
         self._server_health_cache[self._server_key(server)] = time.monotonic()
 
+    def _mark_server_recent_activity(self, server: Server):
+        """记录服务器最近一次处于活跃或刚释放任务的时间。"""
+        self._server_recent_activity[self._server_key(server)] = time.monotonic()
+
     def _clear_server_health_cache(self, server: Server):
         """清除服务器健康检查缓存。"""
         self._server_health_cache.pop(self._server_key(server), None)
+
+    def _has_recent_activity(self, server: Server) -> bool:
+        """判断服务器是否刚结束任务，仍处于短暂恢复窗口。"""
+        last_activity_at = self._server_recent_activity.get(self._server_key(server))
+        if last_activity_at is None:
+            return False
+        return (time.monotonic() - last_activity_at) < self.RECENT_ACTIVITY_GRACE_TTL
+
+    def _get_recent_activity_age(self, server: Server) -> Optional[float]:
+        """获取距最近一次活动的秒数。"""
+        last_activity_at = self._server_recent_activity.get(self._server_key(server))
+        if last_activity_at is None:
+            return None
+        return time.monotonic() - last_activity_at
+
+    def _describe_server_runtime(self, server: Server) -> str:
+        """构造服务器运行态诊断字符串。"""
+        recent_activity_age = self._get_recent_activity_age(server)
+        recent_activity_str = (
+            f"{recent_activity_age:.2f}s"
+            if recent_activity_age is not None
+            else "n/a"
+        )
+        return (
+            f"{server.server_name}(status={server.status.value}, "
+            f"active={self._get_server_active_tasks(server)}/{server.max_concurrency}, "
+            f"recent_activity_age={recent_activity_str})"
+        )
+
+    def describe_dispatch_key_servers(self, dispatch_key: str) -> str:
+        """按调度键返回服务器运行态摘要。"""
+        matched_servers = [
+            server
+            for server in self.running_servers
+            if dispatch_key in self._get_server_dispatch_keys(server)
+        ]
+        if not matched_servers:
+            return "none"
+        return ", ".join(
+            self._describe_server_runtime(server) for server in matched_servers
+        )
 
     def _has_recent_health_check(self, server: Server) -> bool:
         """判断服务器是否有近期成功的健康检查结果。"""
@@ -329,21 +376,37 @@ class ServerManager:
                 s for s in candidate_servers if self._get_server_available_slots(s) > 0
             ]
             candidate_servers.sort(key=lambda x: x.tier.value, reverse=True)
+            candidate_snapshot = [
+                self._describe_server_runtime(server) for server in candidate_servers
+            ]
+
+        if dispatch_key:
+            logger.debug(
+                f"开始分配服务器 dispatch_key={dispatch_key}, "
+                f"resource={task_resource_type}, candidates={candidate_snapshot or ['none']}"
+            )
 
         for server in candidate_servers:
             if not await self.check_server(server):
                 async with self._lock:
                     if not self.check_server_running(server):
                         continue
-                    if self._get_server_active_tasks(server) <= 0:
+                    if (
+                        self._get_server_active_tasks(server) <= 0
+                        and not self._has_recent_activity(server)
+                    ):
                         self.set_server_status(server, ServerStatus.error)
-                        logger.error(f"运行服务器({server})异常，无法连接")
+                        logger.error(
+                            f"服务器健康检查失败并标记为 error: "
+                            f"{self._describe_server_runtime(server)}, dispatch_key={dispatch_key}"
+                        )
                     else:
                         # 高并发下健康检查可能因瞬时排队/限流失败，
-                        # 对仍有活跃任务的服务器先跳过本次分配，避免误标为 error。
+                        # 对仍有活跃任务或刚释放任务的服务器先跳过本次分配，避免误标为 error。
                         self._sync_server_runtime_status(server)
                         logger.warning(
-                            f"运行服务器({server})健康检查失败，但仍有活跃任务，跳过本次分配"
+                            f"服务器健康检查失败，但仍处于活跃/恢复窗口，跳过本次分配: "
+                            f"{self._describe_server_runtime(server)}, dispatch_key={dispatch_key}"
                         )
                 continue
 
@@ -363,9 +426,14 @@ class ServerManager:
                 self._server_active_tasks[server_key] = (
                     self._server_active_tasks.get(server_key, 0) + 1
                 )
+                self._mark_server_recent_activity(server)
                 self._sync_server_runtime_status(server)
                 self._save_servers()
                 self._refresh_idle_events(self._get_server_dispatch_keys(server))
+                logger.debug(
+                    f"服务器分配成功 dispatch_key={dispatch_key}, "
+                    f"{self._describe_server_runtime(server)}"
+                )
                 if available_task_type:
                     await program_manager.record_task_time(
                         available_task_type, start_time
@@ -461,9 +529,11 @@ class ServerManager:
             if current_tasks <= 0:
                 return False
             self._server_active_tasks[server_key] = current_tasks - 1
+            self._mark_server_recent_activity(server)
             self._sync_server_runtime_status(server)
             self._save_servers()
             self._refresh_idle_events(self._get_server_dispatch_keys(server))
+            logger.debug(f"服务器已释放: {self._describe_server_runtime(server)}")
             return True
 
     def set_server_status(self, server: Server, status: ServerStatus):

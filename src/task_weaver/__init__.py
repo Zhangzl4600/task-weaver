@@ -37,7 +37,7 @@ def shutdown():
     program_manager.shutdown()
 
 
-__version__ = "0.3.7"
+__version__ = "0.3.8.1"
 
 # Core functionality
 __all__ = [

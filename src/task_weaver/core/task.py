@@ -34,6 +34,7 @@ class TaskManager:
     def __init__(self):
         """初始化任务管理器的运行态数据结构。"""
         logger.info("Initializing TaskManager...")
+        self._queue_wait_log_threshold = 1.0
         # 每条调度通道独立队列，用于并发调度
         self._queues: Dict[str, asyncio.Queue] = {}
 
@@ -323,6 +324,11 @@ class TaskManager:
         self._tasks[task.task_info.task_id] = task
         await self._ensure_task_processor(dispatch_key)
         await self._queues[dispatch_key].put(task)
+        logger.debug(
+            f"任务已入队 task_id={task.task_info.task_id}, "
+            f"task_type={task.task_info.task_type}, dispatch_key={dispatch_key}, "
+            f"queue_size={self._queues[dispatch_key].qsize()}"
+        )
         await self.update_task_status(
             task.task_info, TaskStatus.INIT, "Task is queued."
         )
@@ -404,7 +410,9 @@ class TaskManager:
                             current_time = datetime.now().timestamp()
                             if current_time - last_warning_time >= warning_interval:
                                 logger.warning(
-                                    f"No available servers for dispatch key {dispatch_key}, waiting..."
+                                    f"当前没有可用服务器 dispatch_key={dispatch_key}, "
+                                    f"queue_size={self._queues[dispatch_key].qsize()}, "
+                                    f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
                                 )
                                 last_warning_time = current_time
                             await asyncio.sleep(0.5)
@@ -459,7 +467,11 @@ class TaskManager:
         self, task: Task, server: Server | None, release_slots: Optional[list[str]] = None
     ) -> None:
         """执行单个任务并记录完整生命周期信息。"""
-        logger.info(f"Starting execution of task {task.task_info.task_id}")
+        dispatch_key = self._get_task_dispatch_key(task)
+        logger.debug(
+            f"开始执行任务 task_id={task.task_info.task_id}, "
+            f"dispatch_key={dispatch_key}, server={server.server_name if server else 'none'}"
+        )
         try:
             task_definition = task_catalog.get_task_definition(task.task_info.task_type)
             if not task_definition or not task_definition.executor:
@@ -476,8 +488,14 @@ class TaskManager:
             task.task_info.wait_duration = (
                 task.task_info.start_time - task.task_info.create_time
             ).total_seconds()
-            logger.info(
-                f"Task {task.task_info.task_id} waited {task.task_info.wait_duration:.2f} seconds in queue"
+            wait_log = (
+                logger.info
+                if task.task_info.wait_duration >= self._queue_wait_log_threshold
+                else logger.debug
+            )
+            wait_log(
+                f"任务 {task.task_info.task_id} 在队列中等待了 {task.task_info.wait_duration:.2f} 秒 "
+                f"(dispatch_key={dispatch_key}, server={server.server_name if server else 'none'})"
             )
 
             logger.debug(f"Executing task {task.task_info.task_id} with executor")
@@ -489,7 +507,10 @@ class TaskManager:
                 task.task_info, TaskStatus.FINISH, "Task completed successfully"
             )
             program_manager.update_finished_task_num(task.task_info.task_type)
-            logger.info(f"Task {task.task_info.task_id} completed successfully")
+            logger.debug(
+                f"任务 {task.task_info.task_id} 执行成功 "
+                f"(dispatch_key={dispatch_key}, server={server.server_name if server else 'none'})"
+            )
 
         except Exception as e:
             error_msg = f"Task execution failed: {str(e)}\n{traceback.format_exc()}"
@@ -505,14 +526,18 @@ class TaskManager:
             task.task_info.execution_duration = (
                 task.task_info.finish_time - task.task_info.start_time
             ).total_seconds()
-            logger.info(
-                f"Task {task.task_info.task_id} execution took {task.task_info.execution_duration:.2f} seconds"
+            logger.debug(
+                f"任务 {task.task_info.task_id} 执行耗时 {task.task_info.execution_duration:.2f} 秒 "
+                f"(status={task.task_info.status.value}, dispatch_key={dispatch_key}, "
+                f"server={server.server_name if server else 'none'})"
             )
-            logger.info(f"执行完成, 资源释放")
+            logger.debug(
+                f"任务执行结束，开始释放资源 task_id={task.task_info.task_id}, "
+                f"dispatch_key={dispatch_key}, server={server.server_name if server else 'none'}"
+            )
             if task:
                 logger.debug(f"Marking task {task.task_info.task_id} as done in queue")
                 await task_catalog.notify_task_completion(task.task_info)
-                dispatch_key = self._get_task_dispatch_key(task)
                 self._queues[dispatch_key].task_done()
             if server:
                 logger.debug(f"Releasing server {server.server_name}")
