@@ -495,9 +495,10 @@ class ServerManager:
             for i in range(3):
                 try:
                     async with httpx.AsyncClient() as client:
-                        await client.get(
-                            f"{server.ip}", timeout=2, follow_redirects=True
-                        )
+                        async with client.stream(
+                            "GET", f"{server.ip}", timeout=2, follow_redirects=True
+                        ) as response:
+                            response.status_code
                     self._mark_server_healthy(server)
                     return True
                 except (httpx.ConnectError, httpx.TimeoutException) as e:
