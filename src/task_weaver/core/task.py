@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, Optional
 
 from ..config import LibraryConfig, config
-from ..exceptions import ProcessingError
+from ..exceptions import ProcessingError, UnsupportedDispatchKeyError
 from ..log.logger import logger
 from ..models.server_models import ResourceType, Server
 from ..models.task_models import Task, TaskInfo, TaskPriority, TaskStatus
@@ -492,11 +492,20 @@ class TaskManager:
 
                     if task_definition.required_resource != ResourceType.API:
                         while not server:
-                            server = await server_manager.get_idle_server(
-                                task_definition.task_type,
-                                task_definition.required_resource,
-                                route_group=route_group,
-                            )
+                            try:
+                                server = await server_manager.get_idle_server(
+                                    task_definition.task_type,
+                                    task_definition.required_resource,
+                                    route_group=route_group,
+                                )
+                            except UnsupportedDispatchKeyError as e:
+                                error_msg = (
+                                    f"Unsupported dispatch key for task "
+                                    f"{task.task_info.task_id}: {dispatch_key}, "
+                                    f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
+                                )
+                                logger.error(error_msg)
+                                raise ProcessingError(error_msg) from e
                             if server:
                                 logger.info(
                                     f"Allocated server {server.server_name} for dispatch key {dispatch_key}"

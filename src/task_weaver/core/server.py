@@ -6,6 +6,7 @@ import traceback
 import httpx
 
 from ..core.program_info import program_manager
+from ..exceptions import UnsupportedDispatchKeyError
 from ..log.logger import logger
 from ..models.server_models import ResourceType, Server, ServerStatus, ServerTier
 from ..utils.routing import DEFAULT_ROUTE_GROUP, build_dispatch_key, normalize_route_group
@@ -106,6 +107,13 @@ class ServerManager:
             return "none"
         return ", ".join(
             self._describe_server_runtime(server) for server in matched_servers
+        )
+
+    def has_dispatch_key_server(self, dispatch_key: str) -> bool:
+        """判断是否存在已注册服务器支持指定调度键。"""
+        return any(
+            dispatch_key in self._get_server_dispatch_keys(server)
+            for server in self.all_servers
         )
 
     def _has_recent_health_check(self, server: Server) -> bool:
@@ -396,6 +404,10 @@ class ServerManager:
                 f"开始分配服务器 dispatch_key={dispatch_key}, "
                 f"resource={task_resource_type}, candidates={candidate_snapshot or ['none']}"
             )
+            if not candidate_snapshot and not self.has_dispatch_key_server(dispatch_key):
+                raise UnsupportedDispatchKeyError(
+                    f"No running server supports dispatch_key={dispatch_key}"
+                )
 
         for server in candidate_servers:
             if not await self.check_server(server):
