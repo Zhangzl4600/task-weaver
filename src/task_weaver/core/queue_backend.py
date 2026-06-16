@@ -190,6 +190,20 @@ class InMemoryQueueBackend(QueueBackend):
         await self.ack(delivery)
         await self.enqueue(delivery.dispatch_key, task)
 
+    async def remove_queued_tasks(self) -> list[Task]:
+        """从内存队列中移除全部尚未被消费者领取的任务。"""
+        removed_tasks: list[Task] = []
+        for queue in self._queues.values():
+            while True:
+                try:
+                    _, payload = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                # 内存队列中尚未 get 出来的任务都还没有分配给处理器，可以直接取消。
+                removed_tasks.append(deserialize_task(payload))
+        return removed_tasks
+
     async def save_task_info(self, task_info: TaskInfo) -> None:
         self._task_infos[task_info.task_id] = serialize_task_info(task_info)
 

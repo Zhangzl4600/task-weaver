@@ -116,6 +116,14 @@ class ServerManager:
             for server in self.all_servers
         )
 
+    def has_running_dispatch_key_server(self, dispatch_key: str) -> bool:
+        """判断运行池里是否存在可等待的、支持指定调度键的服务器。"""
+        return any(
+            dispatch_key in self._get_server_dispatch_keys(server)
+            and server.status not in {ServerStatus.stop, ServerStatus.error}
+            for server in self.running_servers
+        )
+
     def _has_recent_health_check(self, server: Server) -> bool:
         """判断服务器是否有近期成功的健康检查结果。"""
         last_success_at = self._server_health_cache.get(self._server_key(server))
@@ -303,6 +311,20 @@ class ServerManager:
                 if server.check_available_task_route(server_type, normalized_route_group)
             ]
         return bool(candidate_servers)
+
+    async def wait_for_idle_server(self, dispatch_key: str, timeout: float) -> bool:
+        """等待指定调度键出现空闲服务器，超时返回 False。"""
+        self._ensure_server_idle_event(dispatch_key)
+        # 等待前按真实资源状态刷新事件，避免新建事件默认 set 导致空转。
+        self._refresh_idle_events([dispatch_key])
+        try:
+            await asyncio.wait_for(
+                self.server_idle_event[dispatch_key].wait(),
+                timeout=timeout,
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def check_server_running(self, server: Server):
         """判断服务器是否在运行池中。"""

@@ -13,7 +13,7 @@ from ..models.server_models import ResourceType, Server
 from ..models.task_models import Task, TaskInfo, TaskPriority, TaskStatus
 from ..utils.routing import DEFAULT_ROUTE_GROUP, build_dispatch_key, normalize_route_group
 from .program_info import program_manager
-from .queue_backend import QueueBackend, QueueDelivery, build_queue_backend
+from .queue_backend import InMemoryQueueBackend, QueueBackend, QueueDelivery, build_queue_backend
 from .server import server_manager
 from .task_catalog import task_catalog
 
@@ -417,6 +417,28 @@ class TaskManager:
         )
         return task
 
+    async def cancel_unassigned_tasks(self) -> int:
+        """取消全部尚未分配给处理器执行的任务。
+
+        已经被消费者领取、正在执行或已结束的任务不会被取消。
+        返回值为本次实际取消的任务数量。
+        """
+        # 目前只有内存队列能安全地直接清理本进程还没分配的任务；
+        # Redis 队列涉及其他消费者和 pending 状态，不在这里做跨进程批量删除。
+        if not isinstance(self._queue_backend, InMemoryQueueBackend):
+            logger.warning("cancel_unassigned_tasks only supports in-memory queue backend")
+            return 0
+
+        tasks = await self._queue_backend.remove_queued_tasks()
+        for task in tasks:
+            task.task_info.finish_time = datetime.now()
+            task.task_info.error = "Task was cancelled before start."
+            await self.update_task_status(
+                task.task_info, TaskStatus.FAIL, "Task was cancelled before start."
+            )
+            logger.info(f"Cancelled unassigned task {task.task_info.task_id}")
+        return len(tasks)
+
     async def _ensure_task_processor(self, dispatch_key: str) -> None:
         """确保给定任务类型的队列处理协程已启动。"""
         if dispatch_key not in self._is_processor_running:
@@ -491,28 +513,22 @@ class TaskManager:
                         continue
 
                     if task_definition.required_resource != ResourceType.API:
-                        while not server:
-                            try:
-                                server = await server_manager.get_idle_server(
-                                    task_definition.task_type,
-                                    task_definition.required_resource,
-                                    route_group=route_group,
-                                )
-                            except UnsupportedDispatchKeyError as e:
-                                error_msg = (
-                                    f"Unsupported dispatch key for task "
-                                    f"{task.task_info.task_id}: {dispatch_key}, "
-                                    f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
-                                )
-                                logger.error(error_msg)
-                                raise ProcessingError(error_msg) from e
-                            if server:
-                                logger.info(
-                                    f"Allocated server {server.server_name} for dispatch key {dispatch_key}"
-                                )
-                                break
+                        await server_manager.ensure_initialized()
+                        # 如果当前运行池里根本没有支持该调度键的服务器，就没有继续等待的意义。
+                        if not server_manager.has_running_dispatch_key_server(dispatch_key):
+                            error_msg = (
+                                f"Unsupported dispatch key for task "
+                                f"{task.task_info.task_id}: {dispatch_key}, "
+                                f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
+                            )
+                            logger.error(error_msg)
+                            raise ProcessingError(error_msg)
 
-                            # 资源不可用时释放并发槽位，避免阻塞同类型其他可执行子任务
+                        if not server_manager.check_has_idle(
+                            task_definition.task_type, route_group=route_group
+                        ):
+                            # 资源不可用时把未开始任务放回待执行队列，避免在处理协程里
+                            # 高频轮询服务器并持续刷 debug 日志。
                             if acquired_slots:
                                 await self._release_task_slots(acquired_slots)
                                 acquired_slots = []
@@ -528,8 +544,43 @@ class TaskManager:
                                     f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
                                 )
                                 last_warning_time = current_time
-                            await asyncio.sleep(0.5)
-                            acquired_slots = await self._acquire_task_slots(task)
+
+                            # 任务尚未开始执行，先放回队列；等待资源事件可降低无服务器时的日志刷屏。
+                            await self._queue_backend.requeue(delivery, task)
+                            await server_manager.wait_for_idle_server(
+                                dispatch_key, timeout=1.0
+                            )
+                            continue
+
+                        try:
+                            server = await server_manager.get_idle_server(
+                                task_definition.task_type,
+                                task_definition.required_resource,
+                                route_group=route_group,
+                            )
+                        except UnsupportedDispatchKeyError as e:
+                            error_msg = (
+                                f"Unsupported dispatch key for task "
+                                f"{task.task_info.task_id}: {dispatch_key}, "
+                                f"servers={server_manager.describe_dispatch_key_servers(dispatch_key)}"
+                            )
+                            logger.error(error_msg)
+                            raise ProcessingError(error_msg) from e
+
+                        if not server:
+                            if acquired_slots:
+                                await self._release_task_slots(acquired_slots)
+                                acquired_slots = []
+                            # 并发抢占下可能刚检查有空闲、分配时又被占用，放回队列后再等。
+                            await self._queue_backend.requeue(delivery, task)
+                            await server_manager.wait_for_idle_server(
+                                dispatch_key, timeout=1.0
+                            )
+                            continue
+
+                        logger.info(
+                            f"Allocated server {server.server_name} for dispatch key {dispatch_key}"
+                        )
                     else:
                         logger.info(
                             f"{dispatch_key} doesn't require server, executing..."
